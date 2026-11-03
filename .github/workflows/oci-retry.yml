@@ -67,7 +67,7 @@ jobs:
                 --ssh-authorized-keys-file ~/mc.pub 2>&1); then
               echo "LISTO! Instancia creada con $CFG"
               gh issue create --repo "$GITHUB_REPOSITORY" --title "mc-server creada" \
-                --body "Se creó con $CFG. Revisa Oracle → Compute → Instances."
+                --body "@Stalex07 Se creó con $CFG. Revisa Oracle → Compute → Instances."
               gh workflow disable oci-retry.yml --repo "$GITHUB_REPOSITORY"
               exit 0
             fi

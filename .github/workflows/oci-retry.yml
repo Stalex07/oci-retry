@@ -1,0 +1,80 @@
+name: OCI retry
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  issues: write
+
+concurrency:
+  group: oci-retry
+  cancel-in-progress: false
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      C: ${{ secrets.OCI_TENANCY }}
+      AD: ${{ secrets.OCI_AD }}
+      SUBNET: ${{ secrets.OCI_SUBNET }}
+      IMAGE: ${{ secrets.OCI_IMAGE }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # --- Capa 1: herramientas ---
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Instalar OCI CLI
+        run: pip install --quiet oci-cli
+
+      # --- Capa 2: credenciales ---
+      - name: Configurar credenciales
+        env:
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
+          printf '%s\n' "[DEFAULT]" "user=$OCI_USER" "fingerprint=$OCI_FINGERPRINT" \
+            "tenancy=$C" "region=sa-bogota-1" "key_file=$HOME/.oci/key.pem" > ~/.oci/config
+          chmod 600 ~/.oci/key.pem ~/.oci/config
+          printf '%s\n' "$SSH_PUBLIC_KEY" > ~/mc.pub
+          oci iam region-subscription list > /dev/null && echo "Credenciales OK"
+
+      # --- Capa 3: lógica de reintento ---
+      - name: Intentar crear la instancia
+        run: |
+          EXIST=$(oci compute instance list -c "$C" --display-name mc-server \
+            --query "length(data[?\"lifecycle-state\"!='TERMINATED'])" --raw-output 2>/dev/null)
+          if [ -n "$EXIST" ] && [ "$EXIST" != "0" ]; then
+            echo "mc-server ya existe. Desactivando workflow."
+            gh workflow disable oci-retry.yml --repo "$GITHUB_REPOSITORY"
+            exit 0
+          fi
+
+          for CFG in '{"ocpus":2,"memoryInGBs":12}' '{"ocpus":1,"memoryInGBs":6}'; do
+            echo "Intentando $CFG"
+            if OUT=$(oci compute instance launch -c "$C" --availability-domain "$AD" \
+                --display-name mc-server --shape VM.Standard.A1.Flex --shape-config "$CFG" \
+                --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+                --ssh-authorized-keys-file ~/mc.pub 2>&1); then
+              echo "LISTO! Instancia creada con $CFG"
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "mc-server creada" \
+                --body "Se creó con $CFG. Revisa Oracle → Compute → Instances."
+              gh workflow disable oci-retry.yml --repo "$GITHUB_REPOSITORY"
+              exit 0
+            fi
+            if echo "$OUT" | grep -qi -e capacity -e TooManyRequests; then
+              echo "Sin capacidad con $CFG"
+            else
+              echo "Error distinto:"; echo "$OUT"; exit 1
+            fi
+          done
+          echo "Sin capacidad esta vez. Se reintenta en el próximo turno."
